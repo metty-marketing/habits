@@ -88,8 +88,9 @@ function defaultData() {
       h('Second cleanse', 'pm', ALL, { hint: 'Gentle facial cleanser' }),
       h('Retinoid', 'pm', [1, 4]),
       h('Moisturizer', 'pm', ALL),
+      h('Aquaphor', 'pm', ALL, { id: 'aquaphor' }),
       h('Electrolytes', 'supp', ALL, { tag: 'Morning' }),
-      h('Creatine', 'supp', ALL, { tag: 'Afternoon' }),
+      h('Creatine', 'supp', ALL, { tag: 'Morning' }),
       h('Omega-3 fish oil', 'supp', ALL, { tag: 'Afternoon' }),
       h('Multivitamin', 'supp', ALL, { tag: 'Afternoon' }),
       h('Magnesium', 'supp', ALL, { tag: 'Evening' }),
@@ -138,6 +139,22 @@ function migrate(d) {
     const ren = { 'Ultima electrolytes': 'Electrolytes', 'GNC creatine': 'Creatine' };
     for (const h of d.habits) if (ren[h.name]) h.name = ren[h.name];
     d.renamed2 = true;
+  }
+  if (!d.tweak3) {
+    // Aquaphor after evening moisturizer; creatine moves to morning (2026-11-11)
+    if (!d.habits.some(h => h.id === 'aquaphor' || (h.cat === 'pm' && h.name === 'Aquaphor'))) {
+      const aq = { id: 'aquaphor', name: 'Aquaphor', cat: 'pm', kind: 'check', created: '2026-11-11', sched: [{ from: '2026-11-11', days: ALL }], tag: '', notes: false };
+      const i = d.habits.findIndex(h => h.cat === 'pm' && h.name === 'Moisturizer');
+      const last = d.habits.map(h => h.cat).lastIndexOf('pm');
+      d.habits.splice(i >= 0 ? i + 1 : last + 1, 0, aq);
+    }
+    const cr = d.habits.find(h => h.cat === 'supp' && h.name === 'Creatine');
+    if (cr) {
+      cr.tag = 'Morning';
+      const el = d.habits.find(h => h.cat === 'supp' && h.name === 'Electrolytes');
+      if (el) { d.habits.splice(d.habits.indexOf(cr), 1); d.habits.splice(d.habits.indexOf(el) + 1, 0, cr); }
+    }
+    d.tweak3 = true;
   }
   // v2: water and steps are simple check-offs ("hit my goal")
   for (const h of d.habits) {
