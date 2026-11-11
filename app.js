@@ -103,13 +103,26 @@ function defaultData() {
   };
 }
 
+let fresh = false;
 function load() {
   try {
     const raw = localStorage.getItem(KEY);
     if (raw) { const d = JSON.parse(raw); if (d && d.habits && d.days) return migrate(d); }
   } catch (e) { console.warn(e); }
-  return defaultData();
+  fresh = true;
+  const d = defaultData(); d.savedAt = 0; return d;
 }
+/* second copy in IndexedDB, in case localStorage is cleared */
+const idb = (() => {
+  let p = null;
+  const open = () => p || (p = new Promise((res, rej) => {
+    try { const r = indexedDB.open('habits', 1); r.onupgradeneeded = () => r.result.createObjectStore('kv'); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); } catch (e) { rej(e); }
+  }));
+  return {
+    get: () => open().then(db => new Promise((res, rej) => { const q = db.transaction('kv').objectStore('kv').get(KEY); q.onsuccess = () => res(q.result); q.onerror = () => rej(q.error); })),
+    set: v => open().then(db => new Promise((res, rej) => { const t = db.transaction('kv', 'readwrite'); t.objectStore('kv').put(v, KEY); t.oncomplete = res; t.onerror = () => rej(t.error); })),
+  };
+})();
 function migrate(d) {
   const def = defaultData();
   d.settings = Object.assign({}, def.settings, d.settings || {});
@@ -119,12 +132,21 @@ function migrate(d) {
 }
 let S = load();
 let memo = new Map();
-function save(quiet) {
+function save(initial) {
   memo = new Map();
-  try { localStorage.setItem(KEY, JSON.stringify(S)); }
+  if (!initial) S.savedAt = Date.now();
+  const json = JSON.stringify(S);
+  try { localStorage.setItem(KEY, json); }
   catch (e) { toast('Couldn’t save. Storage may be full. Export a backup.'); }
+  idb.set(json).catch(() => {});
 }
-save();
+save(true);
+idb.get().then(raw => {
+  if (!raw) return;
+  const d = JSON.parse(raw);
+  if (d && d.habits && d.days && (fresh || (d.savedAt || 0) > (S.savedAt || 0))) { S = migrate(d); save(true); render(); }
+}).catch(() => {});
+window.addEventListener('pagehide', () => { try { localStorage.setItem(KEY, JSON.stringify(S)); } catch (e) {} });
 if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
 
 const getDay = (k, create) => {
@@ -770,6 +792,9 @@ function renderSettings() {
   html += `<h2>Backup & data</h2><section class="card">
     <div class="small muted" style="margin-bottom:12px">Everything saves automatically on this phone. Backups let you keep a copy in Files or iCloud Drive, and restore it on a new phone.${st.lastBackup ? ` Last backup: ${fmtDate(st.lastBackup, { month: 'short', day: 'numeric', year: 'numeric' })}.` : ' No backup yet.'}</div>
     <div class="grid2"><button class="btn" data-a="exportjson">Backup (JSON)</button><button class="btn" data-a="exportcsv">Export CSV</button></div>
+    <span class="lbl">Move data between devices</span>
+    <div class="small muted" style="margin-bottom:10px">Safari, Chrome and the Home Screen app each keep their own separate copy. To bring entries over, tap Copy on the device that has them, then Paste on the other one. On an iPhone and Mac signed in to the same Apple Account, the clipboard carries over by itself. Days get merged, so nothing on either side is lost.</div>
+    <div class="grid2"><button class="btn" data-a="copydata">Copy my data</button><button class="btn" data-a="pastedata">Paste data</button></div>
     <label class="btn block" style="margin-top:10px">Import backup or CSV<input type="file" accept=".json,.csv,application/json,text/csv" data-f="import" hidden></label>
     <div class="small faint" style="margin-top:12px">JSON restores everything. CSV opens in Excel or Numbers, and can be imported back to update days.</div>
     <button class="btn danger block" style="margin-top:18px" data-a="reset">Erase all data</button></section>
@@ -1012,6 +1037,17 @@ const A = {
   unit: el => { S.settings.waterUnit = el.dataset.v; save(); render(); },
   planrest: el => { const p = S.settings.plan[el.dataset.d]; p.rest = !p.rest; save(); render(); },
   exportjson: async () => { const ok = await shareFile(`habits-backup-${todayKey()}.json`, JSON.stringify(S, null, 1), 'application/json'); if (ok) { S.settings.lastBackup = todayKey(); save(); render(); toast('Backup created'); } },
+  copydata: async () => {
+    try { await navigator.clipboard.writeText(JSON.stringify(S)); toast('Copied. Now tap Paste data on your other device.'); }
+    catch (e) { toast('Copying isn’t allowed here. Use Backup (JSON) instead.'); }
+  },
+  pastedata: async () => {
+    let text = '';
+    try { text = await navigator.clipboard.readText(); } catch (e) { toast('Paste isn’t available here. Use Import instead.'); return; }
+    offerImport(text);
+  },
+  'imp-merge': () => { const snap = snapshot(); const n = mergeData(pendingImport); pendingImport = null; save(); closeSheet(); render(); toast(`Merged ${plural(n, 'day')}`, () => restore(snap)); },
+  'imp-replace': () => { const snap = snapshot(); S = migrate(pendingImport); pendingImport = null; save(); closeSheet(); render(); toast('Replaced with the backup', () => restore(snap)); },
   exportcsv: async () => { await shareFile(`habits-${todayKey()}.csv`, toCSV(), 'text/csv'); },
   reset: () => {
     if (!confirm('Erase every habit and record on this phone? Make a backup first if you might want it.')) return;
@@ -1024,6 +1060,54 @@ function setSched(h, days) {
   if (JSON.stringify([...last.days].sort()) === JSON.stringify([...days].sort())) return;
   if (last.from === t) { last.days = days; if (h.sched.length > 1 && JSON.stringify(h.sched[h.sched.length - 2].days) === JSON.stringify(days)) h.sched.pop(); }
   else h.sched.push({ from: t, days });
+}
+let pendingImport = null;
+function offerImport(text) {
+  let d = null;
+  try { d = JSON.parse(text); } catch (e) {}
+  if (!d || !d.habits || !d.days || !d.settings) { toast('That isn’t Habits data. Copy it again on the other device.'); return; }
+  pendingImport = d;
+  const n = Object.keys(d.days).length;
+  openSheet(() => `<h3>Bring in ${plural(n, 'day')}</h3>
+    <p class="small muted">Merging keeps everything already here and adds anything checked off in the other copy. Replacing makes this device match the other copy exactly.</p>
+    <button class="btn primary block" data-a="imp-merge">Merge (recommended)</button>
+    <button class="btn block" style="margin-top:8px" data-a="imp-replace">Replace everything here</button>
+    <button class="btn block" style="margin-top:8px" data-a="closesheet">Cancel</button>`);
+}
+const RANK = { done: 4, partial: 3, rest: 3, skip: 2 };
+function mergeData(inc) {
+  inc = migrate(inc);
+  const norm = x => (x || '').trim().toLowerCase();
+  const catMap = {};
+  for (const c of inc.cats) {
+    let m = S.cats.find(x => x.id === c.id) || S.cats.find(x => norm(x.name) === norm(c.name));
+    if (!m) { m = { ...c }; S.cats.push(m); }
+    catMap[c.id] = m.id;
+  }
+  const hMap = {};
+  for (const h of inc.habits) {
+    const cid = catMap[h.cat] || h.cat;
+    let m = S.habits.find(x => x.id === h.id) || S.habits.find(x => x.cat === cid && norm(x.name) === norm(h.name));
+    if (!m) { m = { ...h, cat: cid }; S.habits.push(m); }
+    hMap[h.id] = m.id;
+  }
+  let n = 0;
+  for (const k in inc.days) {
+    const src = inc.days[k]; if (!src) continue;
+    const before = JSON.stringify(S.days[k] || null);
+    const d = getDay(k, true);
+    for (const id in (src.h || {})) { const to = hMap[id] || id, v = src.h[id]; if ((RANK[v] || 0) > (RANK[d.h[to]] || 0)) d.h[to] = v; }
+    for (const id in (src.n || {})) { const to = hMap[id] || id; if (src.n[id] && !d.n[to]) d.n[to] = src.n[id]; }
+    if ((src.water || []).length > d.water.length) d.water = [...src.water];
+    if (src.steps != null && (d.steps == null || src.steps > d.steps)) { d.steps = src.steps; d.stepsSrc = src.stepsSrc || ''; }
+    const mv = src.mv || {};
+    for (const f of ['type', 'min', 'note', 'lighter']) if (mv[f] && !d.mv[f]) d.mv[f] = mv[f];
+    if ((mv.extra || 0) > (d.mv.extra || 0)) d.mv.extra = mv.extra;
+    if (src.away) d.away = true;
+    if (JSON.stringify(d) !== before) n++;
+  }
+  const st = inc.settings.start; if (st && st < S.settings.start) S.settings.start = st;
+  return n;
 }
 function moreSheet(id) {
   const h = habit(id), d = getDay(cur), r = evalItem(h, cur, d), st = d && d.h[id];
@@ -1070,10 +1154,7 @@ const F = {
       if (file.name.toLowerCase().endsWith('.csv') || /^\s*date,/.test(text)) {
         const n = importCSV(text); save(); render(); toast(`Imported ${plural(n, 'day')}`, () => restore(snap));
       } else {
-        const d = JSON.parse(text);
-        if (!d || !d.habits || !d.days || !d.settings) throw new Error('not a backup');
-        if (!confirm('Replace everything on this phone with this backup?')) return;
-        S = migrate(d); save(); render(); toast('Backup restored', () => restore(snap));
+        offerImport(text);
       }
     } catch (e) { toast('That file couldn’t be imported'); }
   },
@@ -1114,6 +1195,11 @@ function readStepsFromURL() {
 }
 window.addEventListener('hashchange', readStepsFromURL);
 if (!readStepsFromURL()) render();
-if ('serviceWorker' in navigator && location.protocol === 'https:') navigator.serviceWorker.register('sw.js').catch(() => {});
+if ('serviceWorker' in navigator && location.protocol === 'https:') {
+  const hadController = !!navigator.serviceWorker.controller;
+  let reloaded = false;
+  navigator.serviceWorker.addEventListener('controllerchange', () => { if (hadController && !reloaded) { reloaded = true; save(); location.reload(); } });
+  navigator.serviceWorker.register('sw.js').then(r => { document.addEventListener('visibilitychange', () => { if (!document.hidden) r.update().catch(() => {}); }); }).catch(() => {});
+}
 window.__habits = { get S() { return S; }, set S(v) { S = v; save(); render(); }, render };
 })();
