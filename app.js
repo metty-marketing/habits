@@ -93,9 +93,9 @@ function defaultData() {
       h('Omega-3 fish oil', 'supp', ALL, { tag: 'Afternoon' }),
       h('Multivitamin', 'supp', ALL, { tag: 'Afternoon' }),
       h('Magnesium', 'supp', ALL, { tag: 'Evening' }),
-      { id: 'water', name: 'Water goal', cat: 'water', kind: 'water', created: since, sched: [{ from: since, days: ALL }], tag: '', notes: false },
+      { id: 'water', name: 'Drank 2–3 L of water', cat: 'water', kind: 'check', created: since, sched: [{ from: since, days: ALL }], tag: '', notes: false },
       { id: 'movement', name: 'Planned movement', cat: 'move', kind: 'movement', created: since, sched: [{ from: since, days: ALL }], tag: '', notes: false },
-      { id: 'steps', name: 'Step goal', cat: 'move', kind: 'steps', created: since, sched: [{ from: since, days: ALL }], tag: '', notes: false },
+      { id: 'steps', name: 'Walked 8,000–10,000 steps', cat: 'move', kind: 'check', created: since, sched: [{ from: since, days: ALL }], tag: '', notes: false },
       h('Worked on my business', 'biz', WEEKDAYS, { id: 'biz-own', notes: true, hint: 'Business development, marketing MMC, website, offerings, networking, strategy' }),
       h('Worked on client projects', 'biz', WEEKDAYS, { id: 'biz-client', notes: true, hint: 'Climbing Realty and other clients' }),
     ],
@@ -128,6 +128,19 @@ function migrate(d) {
   d.settings = Object.assign({}, def.settings, d.settings || {});
   d.settings.plan = Object.assign({}, def.settings.plan, d.settings.plan || {});
   d.cats = d.cats || def.cats;
+  // v2: water and steps are simple check-offs ("hit my goal")
+  for (const h of d.habits) {
+    if (h.kind !== 'water' && h.kind !== 'steps') continue;
+    const kind = h.kind; h.kind = 'check';
+    if (kind === 'water' && h.name === 'Water goal') h.name = 'Drank 2–3 L of water';
+    if (kind === 'steps' && h.name === 'Step goal') h.name = 'Walked 8,000–10,000 steps';
+    for (const k in d.days) {
+      const day = d.days[k]; if (!day) continue; day.h = day.h || {};
+      if (day.h[h.id]) continue;
+      const met = kind === 'water' ? (day.water || []).reduce((a, b) => a + b, 0) >= (d.settings.waterGoal || 2000) : (day.steps != null && day.steps >= (d.settings.stepGoal || 8000));
+      if (met) day.h[h.id] = 'done';
+    }
+  }
   return d;
 }
 let S = load();
@@ -624,15 +637,16 @@ function insights() {
   const wh = habit('water');
   if (wh && p30.length >= 5) {
     const st = p30.map(k => evalItem(wh, k, S.days[k])).filter(r => r && r.counted);
-    if (st.length >= 5) { const met = st.filter(r => r.credit >= 1).length; out.push({ t: `You reached your water goal ${Math.round(met / st.length * 100)}% of days over the past ${st.length} days.`, tone: met / st.length >= .7 ? 'good' : '' }); }
+    if (st.length >= 5) { const met = st.filter(r => r.credit >= 1).length; out.push({ t: `You reached your water goal on ${Math.round(met / st.length * 100)}% of the past ${st.length} days.`, tone: met / st.length >= .7 ? 'good' : '' }); }
   }
-  const sv = ks => ks.map(k => S.days[k] && S.days[k].steps).filter(v => v != null);
-  const a = sv(pastKeys(30)), b = sv((() => { const out = []; for (let i = 60; i > 30; i--) out.push(addDays(t, -i)); return out; })());
-  if (a.length >= 7 && b.length >= 7) {
-    const d = avg(a) - avg(b);
-    if (Math.abs(d) >= 300) out.push({ t: d > 0 ? `Your average daily steps are up ${num(d)} over the last 30 days compared with the 30 before.` : `Average daily steps are down ${num(-d)} versus the previous 30 days. A short walk is a great reset.`, tone: d > 0 ? 'good' : 'gentle' });
-    else out.push({ t: `Your daily steps have held steady at about ${num(avg(a))}.`, tone: '' });
-  } else if (a.length >= 5) out.push({ t: `You’ve averaged ${num(avg(a))} steps a day on the days you logged.`, tone: avg(a) >= S.settings.stepGoal ? 'good' : '' });
+  const sh = habit('steps');
+  if (sh && p30.length >= 5) {
+    const st = p30.map(k => evalItem(sh, k, S.days[k])).filter(r => r && r.counted);
+    if (st.length >= 5) { const met = st.filter(r => r.credit >= 1).length; out.push({ t: `You hit your step goal on ${met} of the past ${st.length} days.`, tone: met / st.length >= .6 ? 'good' : '' }); }
+    const r2 = (from, to) => { const ks = []; for (let i = from; i > to; i--) ks.push(addDays(t, -i)); return habitStats(sh, ks.filter(k => k >= startKey())).rate; };
+    const now = r2(30, 0), before = r2(60, 30);
+    if (now != null && before != null && pastKeys(60).length >= 45 && now - before >= .15) out.push({ t: 'You’re hitting your step goal more often than the month before.', tone: 'good' });
+  }
   const mon = weekStarts(1)[0], wk = weekKeys(mon);
   const bizDone = id => wk.filter(k => S.days[k] && S.days[k].h[id] === 'done').length;
   if (habit('biz-own') && wk.length >= 2) {
@@ -729,39 +743,24 @@ function renderProgress() {
   html += keys.length ? '' : `<div class="muted small">Habit-by-habit consistency shows here after your first day.</div>`;
   html += `</section>`;
 
-  // hydration
-  const days30 = keysBack(30);
-  const wv = keys.map(k => waterTotal(S.days[k])).filter(v => v > 0);
-  const wh = habit('water');
-  const wst = wh ? habitStats(wh, keys) : null;
-  const wstreak = wh ? streak(habitOK(wh)) : { cur: 0, best: 0 };
-  const unitOz = S.settings.waterUnit === 'oz';
-  const wf = ml => unitOz ? Math.round(ml / ML_PER_OZ) + ' oz' : (ml / 1000).toFixed(1) + ' L';
-  html += `<h2>Hydration</h2><section class="card"><div class="stats3">
-    <div><div class="k">Avg / day</div><div class="v">${wv.length ? wf(avg(wv)) : '–'}</div></div>
-    <div><div class="k">Goal met</div><div class="v">${wst && wst.n ? Math.round(wst.done / wst.n * 100) + '%' : '–'}</div></div>
-    <div><div class="k">Streak</div><div class="v">${wstreak.cur}<span class="small muted"> / ${wstreak.best}</span></div></div></div>
-    ${bars([days30.map(k => { const v = waterTotal(S.days[k]); return unitOz ? v / ML_PER_OZ : v / 1000; })], { goal: unitOz ? S.settings.waterGoal / ML_PER_OZ : S.settings.waterGoal / 1000, colors: ['var(--water)'], labels: days30.map(k => fmtDate(k, { month: 'numeric', day: 'numeric' })), labelEvery: 7, fmt: v => unitOz ? Math.round(v) + ' oz' : v.toFixed(1) + ' L' })}
-    <div class="small faint" style="margin-top:4px">Last 30 days. Average counts days you logged water.</div></section>`;
-
-  // steps
-  const sv = keys.map(k => S.days[k] && S.days[k].steps).filter(v => v != null);
-  const sh = habit('steps');
-  const sGoalDays = sv.filter(v => v >= S.settings.stepGoal).length;
-  const wsS = weekStarts(8);
-  const weekAvgs = wsS.map(m => avg(weekKeys(m).map(k => S.days[k] && S.days[k].steps).filter(v => v != null)));
-  const months = []; { const d = parseKey(t); for (let i = 5; i >= 0; i--) { const x = new Date(d.getFullYear(), d.getMonth() - i, 1); months.push(x); } }
-  const monthAvg = months.map(m => { const v = []; for (const k in S.days) { const d = parseKey(k); if (d.getFullYear() === m.getFullYear() && d.getMonth() === m.getMonth() && S.days[k].steps != null) v.push(S.days[k].steps); } return avg(v); });
-  html += `<h2>Steps</h2><section class="card"><div class="stats3">
-    <div><div class="k">Avg / day</div><div class="v">${sv.length ? num(avg(sv)) : '–'}</div></div>
-    <div><div class="k">Goal met</div><div class="v">${sv.length ? Math.round(sGoalDays / sv.length * 100) + '%' : '–'}</div></div>
-    <div><div class="k">Best day</div><div class="v">${sv.length ? num(Math.max(...sv)) : '–'}</div></div></div>
-    ${bars([days30.map(k => S.days[k] && S.days[k].steps != null ? S.days[k].steps : null)], { goal: S.settings.stepGoal, colors: ['var(--sage)'], labels: days30.map(k => fmtDate(k, { month: 'numeric', day: 'numeric' })), labelEvery: 7, fmt: v => num(v) })}
-    <span class="lbl">Weekly average</span>
-    ${bars([weekAvgs], { h: 80, goal: S.settings.stepGoal, colors: ['var(--sage)'], labels: wsS.map(m => fmtDate(m, { month: 'numeric', day: 'numeric' })), labelEvery: 2, fmt: v => num(v) })}
-    <span class="lbl">Monthly average</span>
-    ${bars([monthAvg], { h: 80, goal: S.settings.stepGoal, colors: ['var(--sage)'], labels: months.map(m => m.toLocaleDateString('en-US', { month: 'short' })), fmt: v => num(v) })}
-    <div class="small faint" style="margin-top:4px">Averages count days with steps logged. Goal met is out of ${plural(sv.length, 'logged day')} (${rl}).</div></section>`;
+  // water & steps
+  const months = []; { const d = parseKey(t); for (let i = 5; i >= 0; i--) months.push(new Date(d.getFullYear(), d.getMonth() - i, 1)); }
+  const goalHabits = [['water', 'Water goal', 'var(--water)'], ['steps', 'Step goal', 'var(--sage)']].map(([id, label, color]) => ({ h: habit(id), label, color })).filter(x => x.h);
+  if (goalHabits.length) {
+    html += `<h2>Water & steps</h2><section class="card">`;
+    const wsG = weekStarts(12);
+    goalHabits.forEach((x, idx) => {
+      const hs = habitStats(x.h, keys), sk = streak(habitOK(x.h));
+      const hitDays = keysT.filter(k => S.days[k] && S.days[k].h[x.h.id] === 'done').length;
+      const perWeek = wsG.map(m => weekKeys(m).filter(k => S.days[k] && S.days[k].h[x.h.id] === 'done').length);
+      html += `${idx ? '<div style="height:18px"></div>' : ''}<div class="hgroup">${esc(x.h.name)}</div>
+        <div class="stats3"><div><div class="k">Goal hit</div><div class="v">${pct(hs.rate)}</div></div>
+        <div><div class="k">Days hit</div><div class="v">${hitDays}</div></div>
+        <div><div class="k">Streak</div><div class="v">${sk.cur}<span class="small muted"> / ${sk.best}</span></div></div></div>
+        ${bars([perWeek], { h: 70, max: 7, colors: [x.color], labels: wsG.map(m => fmtDate(m, { month: 'numeric', day: 'numeric' })), labelEvery: 3, fmt: v => plural(v, 'day') })}`;
+    });
+    html += `<div class="small faint" style="margin-top:6px">Bars show the days you hit each goal per week. Goal hit is ${rl}.</div></section>`;
+  }
 
   // movement
   const mh = habit('movement');
@@ -860,17 +859,8 @@ function renderSettings() {
   }
   html += `<button class="btn block" data-a="addcat">+ Add category</button>`;
 
-  html += `<h2>Goals</h2><section class="card">
-    <span class="lbl" style="margin-top:0">Water display</span>
-    <div class="seg"><button class="${st.waterUnit === 'oz' ? 'on' : ''}" data-a="unit" data-v="oz">Ounces</button><button class="${st.waterUnit === 'ml' ? 'on' : ''}" data-a="unit" data-v="ml">Milliliters</button></div>
-    <div class="grid2"><div><span class="lbl">Water goal (L)</span><input class="inp" type="number" step="0.1" min="0.5" inputmode="decimal" data-f="waterGoal" value="${st.waterGoal / 1000}"></div>
-      <div><span class="lbl">Stretch goal (L)</span><input class="inp" type="number" step="0.1" min="0.5" inputmode="decimal" data-f="waterStretch" value="${st.waterStretch / 1000}"></div></div>
-    <span class="lbl">Quick-add servings</span>
-    <input class="inp" data-f="servings" value="${esc(st.servings.map(servingLabel).join(', '))}" placeholder="8 oz, 16 oz, 500 ml, 1 L">
-    <div class="small faint" style="margin-top:4px">Separate with commas. Use oz, ml or L.</div>
-    <div class="grid2"><div><span class="lbl">Step goal</span><input class="inp" type="number" inputmode="numeric" data-f="stepGoal" value="${st.stepGoal}"></div>
-      <div><span class="lbl">Stretch goal</span><input class="inp" type="number" inputmode="numeric" data-f="stepStretch" value="${st.stepStretch}"></div></div>
-    <span class="lbl">A day counts toward your streak at</span>
+  html += `<h2>Streaks</h2><section class="card">
+    <span class="lbl" style="margin-top:0">A day counts toward your streak at</span>
     <div class="row"><input type="range" min="50" max="100" step="5" class="grow" data-f="streakPct" value="${st.streakPct}" style="accent-color:var(--brass)"><b id="spv" style="width:48px;text-align:right">${st.streakPct}%</b></div>
     <div class="small faint">Consistency, not perfection. ${st.streakPct}% of scheduled habits keeps the streak going.</div>
   </section>`;
@@ -882,10 +872,6 @@ function renderSettings() {
   }
   html += `<div class="small faint" style="margin-top:8px">“Rest OK” means choosing rest on that day counts as completing your movement. On other days, rest is neutral and never a miss.</div>
     <span class="lbl">Activity types</span><input class="inp" data-f="types" value="${esc(st.activityTypes.join(', '))}"></section>`;
-
-  html += `<h2>Apple Health steps</h2><section class="card">
-    <span class="lbl" style="margin-top:0">Shortcut name</span><input class="inp" data-f="shortcutName" value="${esc(st.shortcutName)}">
-    <button class="btn block" style="margin-top:12px" data-a="stephelp">Set up the steps Shortcut</button></section>`;
 
   html += `<h2>Backup & data</h2><section class="card">
     <div class="small muted" style="margin-bottom:12px">Everything saves automatically on this phone. Backups let you keep a copy in Files or iCloud Drive, and restore it on a new phone.${st.lastBackup ? ` Last backup: ${fmtDate(st.lastBackup, { month: 'short', day: 'numeric', year: 'numeric' })}.` : ' No backup yet.'}</div>
