@@ -132,13 +132,20 @@ function migrate(d) {
 }
 let S = load();
 let memo = new Map();
-function save(initial) {
+const cfgStr = () => JSON.stringify([S.cats, S.habits, S.settings]);
+let lastCfg = cfgStr();
+function saveLocal() {
   memo = new Map();
-  if (!initial) S.savedAt = Date.now();
+  lastCfg = cfgStr();
   const json = JSON.stringify(S);
   try { localStorage.setItem(KEY, json); }
   catch (e) { toast('Couldn’t save. Storage may be full. Export a backup.'); }
   idb.set(json).catch(() => {});
+}
+function save(initial) {
+  if (!initial) { S.savedAt = Date.now(); if (cfgStr() !== lastCfg) S.cfgU = Date.now(); }
+  saveLocal();
+  if (!initial) scheduleSync();
 }
 save(true);
 idb.get().then(raw => {
@@ -149,9 +156,93 @@ idb.get().then(raw => {
 window.addEventListener('pagehide', () => { try { localStorage.setItem(KEY, JSON.stringify(S)); } catch (e) {} });
 if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
 
+/* ---------- sync between devices (private GitHub gist) ---------- */
+const SYNC_KEY = 'habits.sync', GIST_FILE = 'habits-data.json', GIST_DESC = 'Habits app sync (private)';
+let sync = (() => { try { return JSON.parse(localStorage.getItem(SYNC_KEY)) || {}; } catch (e) { return {}; } })();
+let syncState = sync.token ? 'idle' : 'off', syncBusy = false, syncAgain = false, syncTimer = null;
+const saveSync = () => { try { localStorage.setItem(SYNC_KEY, JSON.stringify(sync)); } catch (e) {} };
+function scheduleSync(delay = 1200) { if (!sync.token || !sync.gistId) return; clearTimeout(syncTimer); syncTimer = setTimeout(runSync, delay); }
+async function ghApi(path, opts = {}) {
+  const r = await fetch('https://api.github.com' + path, { ...opts, cache: 'no-store', headers: { Authorization: 'Bearer ' + sync.token, Accept: 'application/vnd.github+json', ...(opts.body ? { 'Content-Type': 'application/json' } : {}) } });
+  if (r.status === 401 || r.status === 403) { const e = new Error('auth'); e.auth = true; throw e; }
+  if (r.status === 404) { const e = new Error('missing'); e.missing = true; throw e; }
+  if (!r.ok) throw new Error('http ' + r.status);
+  return r.status === 204 ? null : r.json();
+}
+async function readGist() {
+  const g = await ghApi('/gists/' + sync.gistId);
+  const f = g.files && g.files[GIST_FILE]; if (!f) return null;
+  let c = f.content;
+  if (f.truncated) c = await fetch(f.raw_url, { cache: 'no-store' }).then(r => r.text());
+  return JSON.parse(c);
+}
+const writeGist = () => ghApi('/gists/' + sync.gistId, { method: 'PATCH', body: JSON.stringify({ files: { [GIST_FILE]: { content: JSON.stringify(S) } } }) });
+function syncMerge(r) {
+  r = migrate(r);
+  let changed = false, ahead = false;
+  if ((r.cfgU || 0) > (S.cfgU || 0)) { S.cats = r.cats; S.habits = r.habits; S.settings = r.settings; S.cfgU = r.cfgU; changed = true; }
+  else if ((S.cfgU || 0) > (r.cfgU || 0)) ahead = true;
+  for (const k of new Set([...Object.keys(S.days), ...Object.keys(r.days)])) {
+    const a = S.days[k], b = r.days[k];
+    if (b && (!a || (b.u || 0) > (a.u || 0))) { S.days[k] = b; changed = true; }
+    else if (a && (!b || (a.u || 0) > (b.u || 0))) ahead = true;
+  }
+  return { changed, ahead };
+}
+let shownSyncState = null;
+function setSyncState(st) {
+  syncState = st;
+  const el = document.getElementById('syncline'); if (el) el.outerHTML = syncLine();
+  if (view === 'settings' && st !== 'syncing' && st !== shownSyncState && !(document.activeElement && document.activeElement.matches('input,textarea,select'))) render();
+}
+async function runSync() {
+  if (!sync.token || !sync.gistId) return;
+  if (syncBusy) { syncAgain = true; return; }
+  syncBusy = true; setSyncState('syncing');
+  try {
+    const remote = await readGist();
+    let push = !remote;
+    if (remote) { const res = syncMerge(remote); if (res.changed) { saveLocal(); render(); } push = res.ahead; }
+    if (push) await writeGist();
+    sync.last = Date.now(); saveSync(); setSyncState('ok');
+  } catch (e) {
+    setSyncState(e.auth ? 'auth' : e.missing ? 'missing' : 'offline');
+  }
+  syncBusy = false;
+  if (syncAgain) { syncAgain = false; scheduleSync(200); }
+}
+async function connectSync(token) {
+  const prev = { ...sync };
+  sync = { token: token.trim() };
+  try {
+    const list = await ghApi('/gists?per_page=100');
+    const g = list.find(x => x.description === GIST_DESC && x.files && x.files[GIST_FILE]);
+    if (g) {
+      sync.gistId = g.id;
+      const remote = await readGist();
+      if (remote && remote.habits && remote.days) { const local = S; S = migrate(remote); mergeData(local); S.cfgU = Date.now(); saveLocal(); }
+      await writeGist();
+    } else {
+      const c = await ghApi('/gists', { method: 'POST', body: JSON.stringify({ description: GIST_DESC, public: false, files: { [GIST_FILE]: { content: JSON.stringify(S) } } }) });
+      sync.gistId = c.id;
+    }
+    sync.last = Date.now(); saveSync(); syncState = 'ok'; return true;
+  } catch (e) {
+    sync = prev; saveSync(); syncState = sync.token ? 'idle' : 'off';
+    toast(e.auth ? 'GitHub didn’t accept that token. Make sure “gist” was checked.' : 'Couldn’t reach GitHub. Check your connection and try again.');
+    return false;
+  }
+}
+function syncLine() {
+  const t = sync.last ? new Date(sync.last).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' }) : '';
+  const msg = { off: '<button class="brass" data-a="syncsetup">Turn on sync</button> to keep your Mac and iPhone in step', idle: 'Sync on', syncing: 'Syncing…', ok: `Synced across your devices${t ? ' · ' + t : ''}`, offline: 'Offline. Changes are saved here and will sync when you’re back online', auth: '<button class="brass" data-a="syncsetup">Sync needs a new token</button>', missing: '<button class="brass" data-a="syncsetup">Sync needs to be set up again</button>' }[syncState];
+  return `<div id="syncline" class="center small faint" style="margin:14px 0 0">${msg}</div>`;
+}
+
 const getDay = (k, create) => {
   let d = S.days[k];
   if (!d && create) d = S.days[k] = { h: {}, n: {}, water: [], steps: null, mv: {}, away: false };
+  if (d && create) d.u = Date.now();
   if (d) { d.h = d.h || {}; d.n = d.n || {}; d.water = d.water || []; d.mv = d.mv || {}; }
   return d;
 };
@@ -278,6 +369,7 @@ let view = 'today', cur = todayKey(), range = 30, openCats = {}, sheetFn = null,
 /* ---------- render: shell ---------- */
 function render() {
   const y = window.scrollY;
+  if (view === 'settings') shownSyncState = syncState;
   document.querySelectorAll('.tabs button').forEach(b => b.classList.toggle('on', b.dataset.v === view));
   $('#main').innerHTML = view === 'today' ? renderToday() : view === 'progress' ? renderProgress() : renderSettings();
   window.scrollTo(0, y);
@@ -351,7 +443,7 @@ function renderToday() {
   }
   html += `<section class="card pausecard"><button class="row" style="width:100%;text-align:left" data-a="away">
       <div class="grow"><b style="font-weight:500">Pause day</b><div class="small muted">Travel, sick, recovery or a day off. Nothing counts as missed.</div></div>
-      <span class="switch ${day && day.away ? 'on' : ''}"></span></button></section>`;
+      <span class="switch ${day && day.away ? 'on' : ''}"></span></button></section>` + syncLine();
   return html;
 }
 const fullDone = k => { const day = S.days[k]; return S.habits.filter(h => { const r = evalItem(h, k, day); return r && r.counted && r.credit >= 1; }).length; };
@@ -750,6 +842,12 @@ function schedLabel(days) {
 function renderSettings() {
   const t = todayKey(), st = S.settings;
   let html = `<h1 style="margin:6px 2px 6px">Routines</h1><div class="muted small" style="margin:0 2px 8px">Changes apply from today forward. Your history stays as it was.</div>`;
+  html += `<h2>Sync between devices</h2><section class="card">${sync.token && sync.gistId ? `
+    <div class="row between"><div><b style="font-weight:500">Sync is on</b><div class="small muted">${syncState === 'ok' && sync.last ? 'Last synced ' + new Date(sync.last).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }) : syncState === 'offline' ? 'Offline right now. Changes will sync later.' : syncState === 'auth' ? 'The token stopped working. Set up again with a new one.' : syncState === 'syncing' ? 'Syncing…' : 'Waiting to sync'}</div></div><span class="switch on"></span></div>
+    <div class="grid2" style="margin-top:12px"><button class="btn" data-a="syncnow">Sync now</button><button class="btn" data-a="syncoff">Turn off</button></div>
+    <div class="small faint" style="margin-top:10px">Your Mac and iPhone share one private copy on your GitHub account. Every change syncs within a few seconds and whenever you open the app.</div>`
+    : `<div class="small muted">Keep your Mac and iPhone in step. Check something off on one and it shows up on the other. Setup takes about 2 minutes, once per device.</div>
+    <button class="btn primary block" style="margin-top:12px" data-a="syncsetup">Set up sync</button>`}</section>`;
   html += `<h2>Habits</h2>`;
   for (const c of S.cats) {
     const hs = S.habits.filter(h => h.cat === c.id);
@@ -1037,6 +1135,16 @@ const A = {
   unit: el => { S.settings.waterUnit = el.dataset.v; save(); render(); },
   planrest: el => { const p = S.settings.plan[el.dataset.d]; p.rest = !p.rest; save(); render(); },
   exportjson: async () => { const ok = await shareFile(`habits-backup-${todayKey()}.json`, JSON.stringify(S, null, 1), 'application/json'); if (ok) { S.settings.lastBackup = todayKey(); save(); render(); toast('Backup created'); } },
+  syncsetup: () => openSheet(syncSheet),
+  syncconnect: async el => {
+    const tok = ($('#synctoken') || {}).value || '';
+    if (!/^(ghp_|github_pat_|gho_)/.test(tok.trim())) { toast('That doesn’t look like a GitHub token. It starts with ghp_'); return; }
+    el.disabled = true; el.textContent = 'Connecting…';
+    const ok = await connectSync(tok);
+    if (ok) { closeSheet(); render(); toast('Sync is on'); } else { el.disabled = false; el.textContent = 'Connect'; }
+  },
+  syncnow: () => runSync(),
+  syncoff: () => { sync = {}; saveSync(); syncState = 'off'; render(); toast('Sync turned off on this device. Your data stays here.'); },
   copydata: async () => {
     try { await navigator.clipboard.writeText(JSON.stringify(S)); toast('Copied. Now tap Paste data on your other device.'); }
     catch (e) { toast('Copying isn’t allowed here. Use Backup (JSON) instead.'); }
@@ -1052,6 +1160,7 @@ const A = {
   reset: () => {
     if (!confirm('Erase every habit and record on this phone? Make a backup first if you might want it.')) return;
     if (prompt('Type ERASE to confirm') !== 'ERASE') return;
+    sync = {}; saveSync(); syncState = 'off';
     S = defaultData(); save(); cur = todayKey(); go('today'); toast('Fresh start');
   },
 };
@@ -1060,6 +1169,23 @@ function setSched(h, days) {
   if (JSON.stringify([...last.days].sort()) === JSON.stringify([...days].sort())) return;
   if (last.from === t) { last.days = days; if (h.sched.length > 1 && JSON.stringify(h.sched[h.sched.length - 2].days) === JSON.stringify(days)) h.sched.pop(); }
   else h.sched.push({ from: t, days });
+}
+function syncSheet() {
+  const link = 'https://github.com/settings/tokens/new?scopes=gist&description=Habits%20app%20sync';
+  return `<div class="steps-help"><h3>Set up sync</h3>
+    <p class="small muted">Your habits are saved to one private file on your GitHub account, and both devices read and write it. You need a GitHub token, which works like a key only this app uses. Make it once and use the same one on both devices.</p>
+    <ol class="small">
+      <li>On your Mac, open <a class="brass" href="${link}" target="_blank" rel="noopener">this GitHub page</a>. It has the right settings filled in.</li>
+      <li>Set <b>Expiration</b> to <b>No expiration</b>. Make sure only <b>gist</b> is checked.</li>
+      <li>Scroll down, click <b>Generate token</b>, and copy the token (it starts with <code>ghp_</code>).</li>
+      <li>Paste it below and tap <b>Connect</b>.</li>
+      <li>On your iPhone, open Habits → Routines → Set up sync and paste the <b>same token</b>. If your Mac and iPhone use the same Apple Account, copying on the Mac lets you paste on the iPhone.</li>
+    </ol>
+    <span class="lbl">GitHub token</span>
+    <input class="inp" id="synctoken" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="ghp_…">
+    <div class="small faint" style="margin-top:6px">The token stays on your devices. It can only read and write your private gists, not your repos.</div>
+    <div class="acts"><button class="btn" data-a="closesheet">Cancel</button><button class="btn primary" data-a="syncconnect">Connect</button></div>
+    <div class="small faint" style="margin-top:10px">Anything already checked off on this device is merged in, so nothing is lost.</div></div>`;
 }
 let pendingImport = null;
 function offerImport(text) {
@@ -1195,6 +1321,10 @@ function readStepsFromURL() {
 }
 window.addEventListener('hashchange', readStepsFromURL);
 if (!readStepsFromURL()) render();
+scheduleSync(300);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) scheduleSync(100); });
+window.addEventListener('online', () => scheduleSync(100));
+setInterval(() => { if (!document.hidden) scheduleSync(0); }, 60000);
 if ('serviceWorker' in navigator && location.protocol === 'https:') {
   const hadController = !!navigator.serviceWorker.controller;
   let reloaded = false;
