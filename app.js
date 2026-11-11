@@ -80,14 +80,14 @@ function defaultData() {
       h('Brush teeth', 'am', ALL),
       h('Gentle cleanser', 'am', ALL),
       h('Vitamin C serum', 'am', ALL),
-      h('La Roche-Posay moisturizer', 'am', ALL),
-      h('EltaMD UV AOX SPF 50', 'am', ALL),
+      h('Moisturizer', 'am', ALL),
+      h('Sunscreen', 'am', ALL),
       h('Brush teeth', 'pm', ALL),
       h('Floss', 'pm', ALL),
       h('First cleanse', 'pm', ALL, { hint: 'Removes makeup, sunscreen and buildup' }),
       h('Second cleanse', 'pm', ALL, { hint: 'Gentle facial cleanser' }),
-      h('Differin 0.1% adapalene', 'pm', [1, 4]),
-      h('La Roche-Posay moisturizer', 'pm', ALL),
+      h('Retinoid', 'pm', [1, 4]),
+      h('Moisturizer', 'pm', ALL),
       h('Ultima electrolytes', 'supp', ALL, { tag: 'Morning' }),
       h('GNC creatine', 'supp', ALL, { tag: 'Afternoon' }),
       h('Omega-3 fish oil', 'supp', ALL, { tag: 'Afternoon' }),
@@ -128,6 +128,12 @@ function migrate(d) {
   d.settings = Object.assign({}, def.settings, d.settings || {});
   d.settings.plan = Object.assign({}, def.settings.plan, d.settings.plan || {});
   d.cats = d.cats || def.cats;
+  // one-time rename of product names (2026-11-11)
+  if (!d.renamed1) {
+    const ren = { 'La Roche-Posay moisturizer': 'Moisturizer', 'EltaMD UV AOX SPF 50': 'Sunscreen', 'Differin 0.1% adapalene': 'Retinoid' };
+    for (const h of d.habits) if (ren[h.name]) h.name = ren[h.name];
+    d.renamed1 = true;
+  }
   // v2: water and steps are simple check-offs ("hit my goal")
   for (const h of d.habits) {
     if (h.kind !== 'water' && h.kind !== 'steps') continue;
