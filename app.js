@@ -88,8 +88,8 @@ function defaultData() {
       h('Second cleanse', 'pm', ALL, { hint: 'Gentle facial cleanser' }),
       h('Retinoid', 'pm', [1, 4]),
       h('Moisturizer', 'pm', ALL),
-      h('Ultima electrolytes', 'supp', ALL, { tag: 'Morning' }),
-      h('GNC creatine', 'supp', ALL, { tag: 'Afternoon' }),
+      h('Electrolytes', 'supp', ALL, { tag: 'Morning' }),
+      h('Creatine', 'supp', ALL, { tag: 'Afternoon' }),
       h('Omega-3 fish oil', 'supp', ALL, { tag: 'Afternoon' }),
       h('Multivitamin', 'supp', ALL, { tag: 'Afternoon' }),
       h('Magnesium', 'supp', ALL, { tag: 'Evening' }),
@@ -133,6 +133,11 @@ function migrate(d) {
     const ren = { 'La Roche-Posay moisturizer': 'Moisturizer', 'EltaMD UV AOX SPF 50': 'Sunscreen', 'Differin 0.1% adapalene': 'Retinoid' };
     for (const h of d.habits) if (ren[h.name]) h.name = ren[h.name];
     d.renamed1 = true;
+  }
+  if (!d.renamed2) {
+    const ren = { 'Ultima electrolytes': 'Electrolytes', 'GNC creatine': 'Creatine' };
+    for (const h of d.habits) if (ren[h.name]) h.name = ren[h.name];
+    d.renamed2 = true;
   }
   // v2: water and steps are simple check-offs ("hit my goal")
   for (const h of d.habits) {
